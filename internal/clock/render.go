@@ -120,6 +120,9 @@ func ShortColumn(ts []string) []string {
 			layout = "01-02 15:04"
 		}
 	}
+	if renderCollides(ts, layout) {
+		layout += " MST"
+	}
 	for i, s := range ts {
 		t, ok := Parse(s)
 		if !ok {
@@ -129,6 +132,29 @@ func ShortColumn(ts []string) []string {
 		out[i] = t.Format(layout)
 	}
 	return out
+}
+
+// renderCollides reports whether two different instants in the column render
+// as the same text under layout. It happens once a year in a zone with
+// daylight saving time: the hour the clocks go back is lived twice, and an
+// hourly column showed `10-25 02:00` on two rows a reader could not tell
+// apart (live run 2026-10-29, `ent hist --stats --period hour`). The zone
+// abbreviation (CEST/CET) is what tells them apart, so the column carries it —
+// on every row, because the shape is a property of the column (D-38).
+func renderCollides(ts []string, layout string) bool {
+	seen := make(map[string]time.Time, len(ts))
+	for _, s := range ts {
+		t, ok := Parse(s)
+		if !ok {
+			continue
+		}
+		text := t.Format(layout)
+		if prev, dup := seen[text]; dup && !prev.Equal(t) {
+			return true
+		}
+		seen[text] = t
+	}
+	return false
 }
 
 // ShortSeconds is Short with seconds, for views where two events inside the

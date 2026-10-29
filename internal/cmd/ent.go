@@ -644,7 +644,7 @@ func runEntHist(ctx context.Context, w, errW io.Writer, entityID string) error {
 	startTime := now.Add(-sinceDur)
 
 	if flagEntStats {
-		return runEntHistStats(ctx, w, cfg, entityID, startTime, now, sinceDur)
+		return runEntHistStats(ctx, w, errW, cfg, entityID, startTime, now, sinceDur)
 	}
 
 	client := haapi.New(cfg.URL, cfg.Token)
@@ -658,7 +658,11 @@ func runEntHist(ctx context.Context, w, errW io.Writer, entityID string) error {
 		startTime.Format(time.RFC3339),
 		now.Format(time.RFC3339))
 	if err != nil {
-		return fmt.Errorf("fetching history: %w", err)
+		// D-47: a long window over a busy sensor is exactly where the raw
+		// history gives out (live run: a 60d window answered 504 three times
+		// in 272s) and where hourly statistics answer in a tenth of a second.
+		return fmt.Errorf("fetching history: %w%s", err,
+			statisticsFallbackHint(ctx, cfg, entityID, startTime, now))
 	}
 	points, err := parseHistoryResponse(data)
 	if err != nil {
@@ -682,7 +686,9 @@ func runEntHist(ctx context.Context, w, errW io.Writer, entityID string) error {
 		}
 		if len(changes) == 0 {
 			if err := errUnknownEntity(ctx, client, entityID); err != nil {
-				return err
+				// A deleted entity keeps its statistics; say so rather than
+				// letting "no live state, no history" read as "nothing exists".
+				return fmt.Errorf("%w%s", err, statisticsFallbackHint(ctx, cfg, entityID, startTime, now))
 			}
 			if err := emitEmptyList(w, "no history data"); err != nil {
 				return err

@@ -1,6 +1,7 @@
 package clock_test
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -176,5 +177,34 @@ func TestLongNamesTheYearInTheReaderZone(t *testing.T) {
 	}
 	if got := clock.Long("not a timestamp"); got != "not a timestamp" {
 		t.Errorf("Long rewrote an unparseable value: %q", got)
+	}
+}
+
+// TestShortColumnTellsTheRepeatedHourApart: when the clocks go back, 02:00
+// happens twice. Both rows rendered `10-25 02:00`; the column now carries the
+// zone abbreviation on every row so the two hours are distinguishable.
+func TestShortColumnTellsTheRepeatedHourApart(t *testing.T) {
+	inBerlin(t)
+	got := clock.ShortColumn([]string{
+		"2026-10-25T00:00:00+00:00", // 02:00 CEST
+		"2026-10-25T01:00:00+00:00", // 02:00 CET
+		"2026-10-25T02:00:00+00:00", // 03:00 CET
+	})
+	want := []string{"2026-10-25 02:00 CEST", "2026-10-25 02:00 CET", "2026-10-25 03:00 CET"}
+	if time.Now().Year() == 2026 {
+		want = []string{"10-25 02:00 CEST", "10-25 02:00 CET", "10-25 03:00 CET"}
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("row %d = %q, want %q", i, got[i], want[i])
+		}
+	}
+
+	// No collision, no zone: the abbreviation is not noise added everywhere.
+	plain := clock.ShortColumn([]string{"2026-10-25T02:00:00+00:00", "2026-10-25T03:00:00+00:00"})
+	for _, p := range plain {
+		if strings.Contains(p, "CET") {
+			t.Errorf("a column without a repeated hour carries the zone: %q", p)
+		}
 	}
 }

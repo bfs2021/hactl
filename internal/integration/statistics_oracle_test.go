@@ -361,3 +361,51 @@ func TestStatisticsCoverageNoteEndToEnd(t *testing.T) {
 		t.Errorf("ent show sun.sun:\n%s", show)
 	}
 }
+
+// TestOracleStatisticIDsAreCaseSensitiveWhereStatesAreNot — the premise of
+// `ent hist --stats` lowercasing its id: HA's state API answers an uppercase
+// entity id with the lowercase entity, while the statistics API treats the
+// uppercase id as unknown. Live, `SENSOR.X --stats` found the entity and then
+// denied it had statistics.
+func TestOracleStatisticIDsAreCaseSensitiveWhereStatesAreNot(t *testing.T) {
+	importStatisticsRig(t)
+	if code, body := ddRequest(t, ha, "GET", "/api/states/SUN.SUN", nil); code != 200 || !strings.Contains(body, `"entity_id":"sun.sun"`) {
+		t.Errorf("GET /api/states/SUN.SUN: HTTP %d %s — if the state API became case-sensitive, "+
+			"errNoStatistic's entity lookup no longer agrees with the lowercased statistics lookup", code, body)
+	}
+	ws := dialRawWS(t, ha.URL(), ha.Token())
+	env := ws.mustSucceed(t, map[string]any{
+		"type": "recorder/get_statistics_metadata", "statistic_ids": []string{strings.ToUpper(statsMeanID)},
+	})
+	if string(env.Result) != "[]" {
+		t.Errorf("uppercase statistic id answered %s — the statistics API now folds case; "+
+			"the lowercasing in runEntHistStats is harmless but no longer needed", env.Result)
+	}
+
+	out := runHactl(t, "ent", "hist", strings.ToUpper(statsMeanID), "--stats", "--since", "80h")
+	if !strings.Contains(out, statsMeanID+": long-term statistics") {
+		t.Errorf("uppercase id through hactl:\n%s", out)
+	}
+}
+
+// TestStatisticsEmptyWindowNamesTheNewestRow — the rig's statistics end at
+// the last full hour before the import, so a window of the last minute is
+// empty and the answer names where the rows end. Also pins that
+// statistics_during_period accepts a start at the Unix epoch, which
+// newestStatistic sends.
+func TestStatisticsEmptyWindowNamesTheNewestRow(t *testing.T) {
+	importStatisticsRig(t)
+	out := runHactl(t, "ent", "hist", statsMeanID, "--stats", "--since", "1m")
+	for _, want := range []string{"no long-term statistics in the last 1m", "note: the newest row ends",
+		"hactl ent hist " + statsMeanID + " --stats --since 1d"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("missing %q:\n%s", want, out)
+		}
+	}
+
+	// An id without an entity and without history points at its statistics.
+	_, err := runHactlErr(t, "ent", "hist", statsMeanID, "--since", "1h")
+	if err == nil || !strings.Contains(err.Error(), "it has long-term statistics") {
+		t.Errorf("plain ent hist on a statistic-only id: err = %v", err)
+	}
+}

@@ -11,6 +11,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/hemm-ems/hactl/internal/haapi"
 )
 
 // The wire shapes below are the ones TestOracleStatistics* captured from HA
@@ -441,5 +443,156 @@ func TestEntHistNoteNeverClaimsBeyondTheWindow(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), "long-term statistics cover the whole window") {
 		t.Errorf("note does not say the window is covered:\n%s", out.String())
+	}
+}
+
+// --- cases from the live run against a real instance (2026-10-29) ---
+
+// TestEntHistStatsNamesTheRealCauseOfMissingStatistics: the live
+// sensor.balkon_illuminance HAS state_class measurement but no statistics (the
+// recorder holds no rows for it), and its old statistics live under
+// sensor.balkon_illuminance_2. The answer used to say "HA keeps them only for
+// entities with a state_class" — false for this entity.
+func TestEntHistStatsNamesTheRealCauseOfMissingStatistics(t *testing.T) {
+	ts := startCmdServer(t, map[string]any{
+		"recorder/get_statistics_metadata": []any{},
+		"recorder/list_statistic_ids": append(append(meanMetadata("sensor.lux_2"),
+			meanMetadata("sensor.cell_7")...), meanMetadata("sensor.cell_8")...),
+	}, map[string]http.HandlerFunc{
+		"/api/states/sensor.lux": func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = fmt.Fprint(w, `{"entity_id":"sensor.lux","state":"695.7","attributes":{"state_class":"measurement"},`+
+				`"last_changed":"2026-10-29T10:00:00+00:00","last_updated":"2026-10-29T10:00:00+00:00",`+
+				`"context":{"id":"c","parent_id":null,"user_id":null}}`)
+		},
+	})
+	withFlagDir(t, ts.dir)
+	withEntHistFlags(t, "24h", true, "")
+
+	err := runEntHist(context.Background(), io.Discard, io.Discard, "sensor.lux")
+	if err == nil {
+		t.Fatal("no statistics answered nil")
+	}
+	msg := err.Error()
+	if strings.Contains(msg, "only for entities with a state_class") {
+		t.Errorf("claims the entity lacks a state_class it has: %s", msg)
+	}
+	for _, want := range []string{"state_class measurement", "sensor.lux_2"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("message missing %q: %s", want, msg)
+		}
+	}
+
+	// Siblings sharing a numbered stem are not renames.
+	err = runEntHist(context.Background(), io.Discard, io.Discard, "sensor.cell_9")
+	if err == nil || strings.Contains(err.Error(), "cell_7") || strings.Contains(err.Error(), "cell_8") {
+		t.Errorf("sibling statistics named as a rename: %v", err)
+	}
+}
+
+// TestEntHistStatsLowercasesTheID: HA's state API is case-insensitive, its
+// statistics API is not; `SENSOR.X --stats` found the entity and then denied
+// it had statistics.
+func TestEntHistStatsLowercasesTheID(t *testing.T) {
+	start := time.Date(2026, 10, 27, 0, 0, 0, 0, time.UTC).UnixMilli()
+	ts := startCmdServer(t, map[string]any{
+		"recorder/get_statistics_metadata": meanMetadata("sensor.temp"),
+		"recorder/statistics_during_period": map[string]any{"sensor.temp": []any{
+			map[string]any{"start": start, "end": start + statsHour, "mean": 21.5, "min": 19.0, "max": 24.25},
+		}},
+	}, nil)
+	withFlagDir(t, ts.dir)
+	withEntHistFlags(t, "24h", true, "")
+
+	var buf bytes.Buffer
+	if err := runEntHist(context.Background(), &buf, io.Discard, "SENSOR.Temp"); err != nil {
+		t.Fatalf("uppercase id: %v", err)
+	}
+	if ids, _ := ts.lastParams("recorder/get_statistics_metadata")["statistic_ids"].([]any); len(ids) != 1 || ids[0] != "sensor.temp" {
+		t.Errorf("metadata asked for %v, want [sensor.temp]", ids)
+	}
+}
+
+// TestEntHistStatsEmptyWindowNamesTheNewestRow: a deleted entity's statistic
+// keeps its rows forever; the live one ended in 2022 and the answer was only
+// "nothing in the last 365d".
+func TestEntHistStatsEmptyWindowNamesTheNewestRow(t *testing.T) {
+	// The mock answers every period with the same rows, so it cannot serve an
+	// empty window and a non-empty history at once; this drives the helper
+	// the empty-window path calls. 2022-10-31 22:00 → 2026-10-29 12:00 is
+	// 1458.6 days, so the smallest covering window is 1459d.
+	month := time.Date(2022, 10, 1, 0, 0, 0, 0, time.UTC)
+	lastHour := time.Date(2022, 10, 31, 22, 0, 0, 0, time.UTC)
+	ts := startCmdServer(t, map[string]any{
+		"recorder/statistics_during_period": map[string]any{"sensor.old": []any{
+			map[string]any{"start": month.UnixMilli(), "end": month.AddDate(0, 1, 0).UnixMilli(), "mean": 44.5},
+			map[string]any{"start": lastHour.UnixMilli(), "end": lastHour.Add(time.Hour).UnixMilli(), "mean": 0.0},
+		}},
+	}, nil)
+	withFlagDir(t, ts.dir)
+	withEntHistFlags(t, "365d", true, "")
+
+	ws := haapi.NewWSClient(ts.srv.URL, "test-token")
+	if err := ws.Connect(context.Background()); err != nil {
+		t.Fatalf("connecting to the rig: %v", err)
+	}
+	t.Cleanup(func() { _ = ws.Close() })
+	now := time.Date(2026, 10, 29, 12, 0, 0, 0, time.UTC)
+	hint := newestStatisticHint(context.Background(), ws, "sensor.old", now)
+	if !strings.Contains(hint, "hactl ent hist sensor.old --stats --since 1459d") {
+		t.Errorf("hint = %q, want a --since reaching the newest row", hint)
+	}
+	if ts.lastParams("recorder/statistics_during_period")["period"] != "hour" {
+		t.Errorf("the newest row was not narrowed to the hour")
+	}
+}
+
+// TestEntHistUnknownEntityPointsAtItsStatistics: `ent hist` on a deleted
+// entity said "no live state, and no recorded history" while years of its
+// statistics were one flag away.
+func TestEntHistUnknownEntityPointsAtItsStatistics(t *testing.T) {
+	end := time.Now().Add(-400 * 24 * time.Hour).Truncate(time.Hour)
+	ts := startCmdServer(t, map[string]any{
+		"recorder/get_statistics_metadata": meanMetadata("sensor.gone"),
+		"recorder/statistics_during_period": map[string]any{"sensor.gone": []any{
+			map[string]any{"start": end.Add(-time.Hour).UnixMilli(), "end": end.UnixMilli(), "mean": 80.0},
+		}},
+	}, map[string]http.HandlerFunc{
+		"/api/history/period/": func(w http.ResponseWriter, _ *http.Request) { _, _ = fmt.Fprint(w, "[]") },
+	})
+	withFlagDir(t, ts.dir)
+	withEntHistFlags(t, "30d", false, "")
+
+	err := runEntHist(context.Background(), io.Discard, io.Discard, "sensor.gone")
+	if err == nil {
+		t.Fatal("unknown entity answered nil")
+	}
+	for _, want := range []string{"no live state", "it has long-term statistics", "hactl ent hist sensor.gone --stats --since 401d"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error missing %q: %v", want, err)
+		}
+	}
+}
+
+// TestEntHistFailedHistoryPointsAtStatistics: a 60d window over a busy sensor
+// answered 504 three times in 272s on the live instance; --stats answered the
+// same window in 0.1s.
+func TestEntHistFailedHistoryPointsAtStatistics(t *testing.T) {
+	start := time.Now().Add(-2 * time.Hour).Truncate(time.Hour)
+	ts := startCmdServer(t, map[string]any{
+		"recorder/get_statistics_metadata": meanMetadata("sensor.busy"),
+		"recorder/statistics_during_period": map[string]any{"sensor.busy": []any{
+			map[string]any{"start": start.UnixMilli(), "end": start.Add(time.Hour).UnixMilli(), "mean": 5.0},
+		}},
+	}, map[string]http.HandlerFunc{
+		"/api/history/period/": func(w http.ResponseWriter, _ *http.Request) {
+			http.Error(w, "upstream timed out", http.StatusBadRequest)
+		},
+	})
+	withFlagDir(t, ts.dir)
+	withEntHistFlags(t, "60d", false, "")
+
+	err := runEntHist(context.Background(), io.Discard, io.Discard, "sensor.busy")
+	if err == nil || !strings.Contains(err.Error(), "hactl ent hist sensor.busy --stats --since 60d") {
+		t.Errorf("err = %v, want a pointer to --stats over the same window", err)
 	}
 }

@@ -124,3 +124,21 @@ func (ws *WSClient) StatisticsDuringPeriod(ctx context.Context, id string, start
 	}
 	return byID[id], nil
 }
+
+// ListStatisticIDs returns the metadata of every statistic HA keeps — the
+// same row shape get_statistics_metadata answers (oracle-probed). Used only
+// on the "no such statistic" path, to name ids a renamed entity left behind.
+func (ws *WSClient) ListStatisticIDs(ctx context.Context) ([]StatisticMetadata, error) {
+	result, err := ws.sendCommand(ctx, "recorder/list_statistic_ids", nil)
+	if err != nil {
+		return nil, err
+	}
+	var meta []StatisticMetadata
+	if err := json.Unmarshal(result, &meta); err != nil {
+		return nil, fmt.Errorf("parsing statistic ids: %w", err)
+	}
+	if err := degeneracy.Check("recorder/list_statistic_ids", &meta); err != nil {
+		return nil, err
+	}
+	return meta, nil
+}

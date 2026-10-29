@@ -325,9 +325,18 @@ window aggregates only the part of that week inside it, so its `change` is not
 a whole week's consumption. Under
 `--json` each row carries `start`, `end` and every field Home Assistant
 returned (`null` where it has none). `--stats` cannot be combined with `--attr`
-or `--resample`; `--period` requires `--stats`. An entity without statistics is
-an error that says why (no `state_class`) — run `ent hist` without `--stats`
-for it. An empty window on a statistic that exists is an empty list.
+or `--resample`; `--period` requires `--stats`. Ids are matched lowercase, as
+Home Assistant writes them. A missing statistic is an error that says which
+case it is — no such entity; an entity without a `state_class` (HA compiles
+statistics only for those — run `ent hist` without `--stats`); or an entity
+WITH one that still has none (the recorder holds no rows for it, or it is
+under an hour old) — and names statistics under a neighbouring id
+(`sensor.x` ↔ `sensor.x_2`), where a renamed entity's old rows live. An empty
+window on a statistic that exists is an empty list followed by a `note:` with
+the newest row's time and a `--since` that reaches it (stderr under `--json`).
+Statistics outlive their entity: `ent hist` on a deleted entity, and an
+`ent hist` whose history request fails (a long window over a busy sensor can
+exceed `--timeout`), end with the `--stats` command that answers instead.
 `ent show` says whether an entity has long-term statistics (`statistics: mean
 °C`, `sum kWh`, or `none`).
 
