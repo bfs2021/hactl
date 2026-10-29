@@ -402,13 +402,29 @@ func (c *Client) doWithRetry(req *http.Request) ([]byte, error) {
 		return 500 * time.Millisecond << attempt // 500ms, 1s
 	}
 
+	// D-34: --timeout bounds every connection, "including a retry the caller
+	// did not ask for", because two attempts do not entitle a command to twice
+	// the time the caller allowed. WSClient.Connect already runs its retry
+	// inside the budget; this loop used to hand every attempt a fresh full
+	// per-request deadline, so a GET behind a proxy that 504s after 90s took
+	// 272s at --timeout 180s (#155). The deadline is taken once, here, and
+	// every attempt shares it: a retry starts only while budget remains, and
+	// gets only what remains. A Timeout of 0 means no bound at all, and is
+	// honoured as such.
+	ctx := req.Context()
+	if budget := c.httpClient.Timeout; budget > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, budget)
+		defer cancel()
+	}
+
 	for attempt := range maxAttempts {
 		if bodyBytes != nil {
 			req.Body = io.NopCloser(bytes.NewReader(bodyBytes))
 		}
 
 		start := time.Now()
-		resp, err := c.httpClient.Do(req) //nolint:gosec // URL is constructed from user-provided baseURL by design
+		resp, err := c.httpClient.Do(req.WithContext(ctx)) //nolint:gosec // URL is constructed from user-provided baseURL by design
 		duration := time.Since(start)
 
 		if err != nil {
@@ -431,7 +447,11 @@ func (c *Client) doWithRetry(req *http.Request) ([]byte, error) {
 		// three times, and `config flow-step --confirm` could create three
 		// config entries. The companion client had the rule and this one did
 		// not, which is why the predicate now lives in one shared package.
-		if resp.StatusCode >= 500 && attempt < maxAttempts-1 && httpretry.IsIdempotent(req.Method) {
+		//
+		// The ctx.Err() check is D-34's other half: a retry the caller did not
+		// ask for starts only while the budget it shares with the attempts
+		// already made still has something left.
+		if resp.StatusCode >= 500 && attempt < maxAttempts-1 && httpretry.IsIdempotent(req.Method) && ctx.Err() == nil {
 			slog.Debug("retrying request due to server error", "method", req.Method, "status", resp.StatusCode, "attempt", attempt+1) //nolint:gosec // structured log
 			time.Sleep(backoff(attempt))
 			continue

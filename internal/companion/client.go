@@ -746,6 +746,22 @@ func (c *Client) doWithRetry(req *http.Request) ([]byte, error) {
 	backoffs := []time.Duration{500 * time.Millisecond, 1 * time.Second}
 	maxAttempts := len(backoffs) + 1
 
+	// D-34: --timeout bounds every connection, "including a retry the caller
+	// did not ask for", because two attempts do not entitle a command to twice
+	// the time the caller allowed. WSClient.Connect and the HA REST client
+	// already run their retries inside the budget; this loop used to hand every
+	// attempt a fresh full per-request deadline, so a 5xx the server answers
+	// slowly was retried with the full budget again (#155). The deadline is
+	// taken once, here, and every attempt shares it: a retry starts only while
+	// budget remains, and gets only what remains. A Timeout of 0 means no
+	// bound at all, and is honoured as such.
+	ctx := req.Context()
+	if budget := c.httpClient.Timeout; budget > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, budget)
+		defer cancel()
+	}
+
 	for attempt := range maxAttempts {
 		if bodyBytes != nil {
 			req.Body = io.NopCloser(bytes.NewReader(bodyBytes))
@@ -760,8 +776,11 @@ func (c *Client) doWithRetry(req *http.Request) ([]byte, error) {
 			return nil, err
 		}
 
-		respBody, status, err := c.doOnce(req)
-		if shouldRetry(err, status, hasIngressAuth, req.Method) && attempt < len(backoffs) {
+		respBody, status, err := c.doOnce(req.WithContext(ctx))
+		// The ctx.Err() check is D-34's other half: a retry the caller did not
+		// ask for starts only while the budget it shares with the attempts
+		// already made still has something left.
+		if shouldRetry(err, status, hasIngressAuth, req.Method) && attempt < len(backoffs) && ctx.Err() == nil {
 			slog.Warn("retrying companion request", "method", req.Method, "status", status, "attempt", attempt+1, "error", err) //nolint:gosec // method is a Go HTTP constant
 			time.Sleep(backoffs[attempt])
 			continue

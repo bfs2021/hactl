@@ -9,6 +9,9 @@ import (
 	"sync/atomic"
 	"syscall"
 	"testing"
+	"time"
+
+	"github.com/hemm-ems/hactl/internal/haapi"
 )
 
 func TestShouldRetry_Idempotency(t *testing.T) {
@@ -82,6 +85,45 @@ func TestGetRetriedOn5xx(t *testing.T) {
 	}
 	if got := calls.Load(); got != 2 {
 		t.Errorf("GET issued %d times, want 2 (one retry)", got)
+	}
+}
+
+// TestRetriesShareTheCallerTimeoutBudget — finding #155 on the companion
+// transport: every retry used to start a fresh per-request deadline, so a 5xx
+// the server answers slowly was retried with the full budget again. D-34
+// already decided the caller's bound covers "every connection, including a
+// retry the caller did not ask for", and both the HA REST client and the WS
+// connect run their retries inside the budget — this one now does too.
+func TestRetriesShareTheCallerTimeoutBudget(t *testing.T) {
+	prev := haapi.DefaultTimeout
+	haapi.DefaultTimeout = 500 * time.Millisecond
+	t.Cleanup(func() { haapi.DefaultTimeout = prev })
+
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls.Add(1)
+		// Slow enough to eat most of the 500ms budget, then a 5xx — the shape
+		// that used to buy every attempt a fresh full deadline.
+		time.Sleep(400 * time.Millisecond)
+		w.WriteHeader(http.StatusBadGateway)
+	}))
+	defer srv.Close()
+
+	start := time.Now()
+	_, err := New(srv.URL, "t").ListConfigFiles(context.Background())
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("a 502 from the companion must surface as an error")
+	}
+	// Three 400ms attempts plus the two backoff sleeps used to add up to ~2.7s.
+	// The margin is generous on purpose: this must fail for the reported reason
+	// (a fresh budget per attempt) and never for a slow machine.
+	if elapsed > 2*time.Second {
+		t.Errorf("the call took %v at --timeout 500ms: a retry was handed a fresh full budget", elapsed)
+	}
+	if got := calls.Load(); got > 2 {
+		t.Errorf("the server saw %d requests at --timeout 500ms: a retry started with no budget left", got)
 	}
 }
 
